@@ -1,3 +1,11 @@
+"""testbuild — a compact declarative black-box testing toolkit.
+
+A :class:`Tester` describes a suite.  The executable is deliberately supplied
+only to :meth:`Tester.run`, so one suite can be run against any student build.
+The built-in pretest checks process mechanics only; task-specific assertions
+belong to user-defined :class:`Expected` implementations.
+"""
+
 from __future__ import annotations
 
 import json
@@ -29,7 +37,7 @@ from typing import (
 	Union,
 )
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 PathLike = Union[str, os.PathLike[str]]
 Payload = Union[str, bytes]
@@ -78,10 +86,15 @@ class DynamicWrapper(Enum):
 	NONE = "none"
 	VALGRIND = "valgrind"
 	GDB = "gdb"
+	DR_MEMORY = "drmemory"
+	WINDBG = "windbg"
 
 	NO_WRAPPER = NONE
 	VALGRIND_ANALYZER = VALGRIND
 	GDB_DEBUGGER = GDB
+	DR_MEMORY_ANALYZER = DR_MEMORY
+	DRMEMORY = DR_MEMORY
+	WINDBG_DEBUGGER = WINDBG
 
 
 class VerdictCode(Enum):
@@ -96,6 +109,8 @@ class VerdictCode(Enum):
 	HOOK_ERROR = "hook failed"
 	VALGRIND_ERROR = "valgrind error"
 	GDB_ERROR = "gdb error"
+	DR_MEMORY_ERROR = "Dr. Memory error"
+	WINDBG_ERROR = "WinDbg error"
 	INTERNAL_ERROR = "internal error"
 
 
@@ -854,8 +869,17 @@ class Tester:
 	def __ensure_wrapper_available(wrapper: DynamicWrapper) -> None:
 		if wrapper is DynamicWrapper.NONE:
 			return
-		if shutil.which(wrapper.value) is None:
-			raise FileNotFoundError(f"dynamic wrapper is not installed: {wrapper.value}")
+		if wrapper in (DynamicWrapper.DR_MEMORY, DynamicWrapper.WINDBG):
+			if os.name != "nt":
+				raise OSError(f"{wrapper.value} is available only on Windows")
+		executable = {
+			DynamicWrapper.DR_MEMORY: "drmemory.exe",
+			DynamicWrapper.WINDBG: "cdb.exe",
+		}.get(wrapper, wrapper.value)
+		if shutil.which(executable) is None:
+			raise FileNotFoundError(
+				f"dynamic wrapper is not installed or not in PATH: {executable}"
+			)
 
 	def __print_result(self, result: TestResult) -> None:
 		marker = "SKIP" if result.skipped else "PASS" if result.passed else "FAIL"
@@ -962,6 +986,8 @@ class Tester:
 		context: ActionContext,
 	) -> Runned:
 		wrapper_log_path = context.workdir / f".testbuild-{wrapper.value}.log"
+		if wrapper is DynamicWrapper.DR_MEMORY:
+			wrapper_log_path.mkdir(exist_ok=True)
 		command = self.__command(executable, run.args, wrapper, wrapper_log_path)
 		environment = dict(context.env)
 		environment.update(run.env)
@@ -997,10 +1023,7 @@ class Tester:
 					wrapper_log_path,
 				)
 			except subprocess.TimeoutExpired:
-				if os.name == "posix":
-					os.killpg(process.pid, signal.SIGKILL)
-				else:
-					process.kill()
+				self.__kill_process(process)
 				stdout, stderr = process.communicate()
 				return self.__make_runned(
 					executable,
@@ -1019,7 +1042,7 @@ class Tester:
 				)
 		except Exception as error:
 			if process is not None and process.poll() is None:
-				process.kill()
+				self.__kill_process(process)
 				process.communicate()
 			return self.__make_runned(
 				executable,
@@ -1036,6 +1059,27 @@ class Tester:
 				wrapper_log_path,
 				launch_error=f"{type(error).__name__}: {error}",
 			)
+
+	@staticmethod
+	def __kill_process(process: subprocess.Popen[bytes]) -> None:
+		if process.poll() is not None:
+			return
+		try:
+			if os.name == "posix":
+				os.killpg(process.pid, signal.SIGKILL)
+			elif os.name == "nt":
+				subprocess.run(
+					["taskkill", "/PID", str(process.pid), "/T", "/F"],
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL,
+					check=False,
+				)
+				if process.poll() is None:
+					process.kill()
+			else:
+				process.kill()
+		except ProcessLookupError:
+			pass
 
 	@staticmethod
 	def __command(
@@ -1083,6 +1127,46 @@ class Tester:
 				str(executable),
 				*args,
 			]
+		if wrapper is DynamicWrapper.DR_MEMORY:
+			# Trial variant: add "-light" for faster but less complete checking.
+			# Trial variant: replace "-quiet" with "-results_to_stderr" to
+			# stream reports, at the cost of mixing them with application stderr.
+			drmemory_options = [
+				"-batch",
+				"-quiet",
+				"-exit_code_if_errors",
+				"125",
+				"-logdir",
+				str(log_path),
+			]
+			return [
+				"drmemory.exe",
+				*drmemory_options,
+				"--",
+				str(executable),
+				*args,
+			]
+		if wrapper is DynamicWrapper.WINDBG:
+			# GUI trial variants.  cdb.exe is the WinDbg engine's console
+			# frontend and is the predictable choice for unattended tests.
+			# debugger = "windbg.exe"  # WinDbg Classic; add "-Q".
+			# debugger = "WinDbgX.exe"  # Modern WinDbg; may keep its UI open.
+			debugger = "cdb.exe"
+			commands = (
+				'sxe -c2 ".echo TESTBUILD_FATAL_EXCEPTION; '
+				'!analyze -v; q" *; g'
+			)
+			return [
+				debugger,
+				"-G",
+				"-logo",
+				str(log_path),
+				"-c",
+				commands,
+				# Trial variant: add "-o" to debug child processes as well.
+				str(executable),
+				*args,
+			]
 		return [str(executable), *args]
 
 	def __make_runned(
@@ -1104,10 +1188,23 @@ class Tester:
 		launch_error: Optional[str] = None,
 	) -> Runned:
 		wrapper_log: Optional[str] = None
-		if wrapper is not DynamicWrapper.NONE and wrapper_log_path.is_file():
+		if wrapper is DynamicWrapper.DR_MEMORY and wrapper_log_path.is_dir():
+			results = list(wrapper_log_path.glob("DrMemory-*/results.txt"))
+			if results:
+				latest = max(results, key=lambda path: path.stat().st_mtime_ns)
+				wrapper_log = latest.read_text(encoding="utf-8", errors="replace")
+		elif wrapper is not DynamicWrapper.NONE and wrapper_log_path.is_file():
 			wrapper_log = wrapper_log_path.read_text(
 				encoding="utf-8", errors="replace"
 			)
+		if wrapper is DynamicWrapper.WINDBG and wrapper_log is not None:
+			exit_codes = re.findall(
+				r"exited with code\s+(-?\d+)\s+\(0x[0-9a-f]+\)",
+				wrapper_log,
+				flags=re.IGNORECASE,
+			)
+			if exit_codes:
+				returncode = int(exit_codes[-1])
 		return Runned(
 			executable,
 			group.name,
@@ -1221,6 +1318,25 @@ class Tester:
 				return Verdict(
 					VerdictCode.GDB_ERROR,
 					"the program terminated by a signal",
+					tuple(log.splitlines()),
+				)
+		elif runned.dynamic_wrapper is DynamicWrapper.DR_MEMORY:
+			summary = re.search(
+				r"ERRORS FOUND:\s*(?:~~Dr\.M~~\s*)?([1-9]\d*)\s+unique",
+				log,
+				flags=re.IGNORECASE,
+			)
+			if runned.returncode == 125 or summary is not None:
+				return Verdict(
+					VerdictCode.DR_MEMORY_ERROR,
+					"memory errors were reported",
+					tuple(log.splitlines()),
+				)
+		elif runned.dynamic_wrapper is DynamicWrapper.WINDBG:
+			if "TESTBUILD_FATAL_EXCEPTION" in log:
+				return Verdict(
+					VerdictCode.WINDBG_ERROR,
+					"the program terminated with an unhandled exception",
 					tuple(log.splitlines()),
 				)
 		return OK
