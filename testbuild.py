@@ -37,7 +37,7 @@ from typing import (
 	Union,
 )
 
-__version__ = "0.0.3"
+__version__ = "0.0.5"
 
 PathLike = Union[str, os.PathLike[str]]
 Payload = Union[str, bytes]
@@ -176,7 +176,7 @@ class Expected(ABC):
 class Run:
 	name: str = "run"
 	args: List[str] = field(default_factory=list)
-	stdin: InputValue = None
+	stdin: Optional[str] = None
 	timeout: float = 1.0
 	returncode_policy: ReturnCodePolicy = ReturnCodePolicy.SHOULD_BE_ZERO
 	expected_returncode: Optional[int] = None
@@ -212,8 +212,8 @@ class Runned:
 	command: Tuple[str, ...]
 	workdir: Path
 	returncode: Optional[int]
-	stdout: bytes
-	stderr: bytes
+	stdout: Union[bytes, str]
+	stderr: Union[bytes, str]
 	duration: float
 	dynamic_wrapper: DynamicWrapper
 	wrapper_log: Optional[str] = None
@@ -223,10 +223,14 @@ class Runned:
 
 	@property
 	def stdout_text(self) -> str:
+		if isinstance(self.stdout, str):
+			return self.stdout
 		return self.stdout.decode(self.encoding, errors="replace")
 
 	@property
 	def stderr_text(self) -> str:
+		if isinstance(self.stderr, str):
+			return self.stderr
 		return self.stderr.decode(self.encoding, errors="replace")
 
 	# Compatibility-minded accessors make porting old Expected classes easy.
@@ -436,15 +440,12 @@ class RunBuilder:
 		self.__spec.args = [str(item) for item in value]
 
 	@property
-	def stdin(self) -> InputValue:
+	def stdin(self) -> Optional[str]:
 		return self.__spec.stdin
 
 	@stdin.setter
-	def stdin(self, value: InputValue) -> None:
+	def stdin(self, value: Optional[str]) -> None:
 		self.__spec.stdin = value
-
-	def stdin_from(self, path: PathLike, *, binary: bool = False) -> None:
-		self.stdin = from_file(path, binary=binary)
 
 	@property
 	def timeout(self) -> float:
@@ -991,9 +992,9 @@ class Tester:
 		command = self.__command(executable, run.args, wrapper, wrapper_log_path)
 		environment = dict(context.env)
 		environment.update(run.env)
-		stdin = self.__payload(run.stdin)
+		stdin = run.stdin
 		started = time.monotonic()
-		process: Optional[subprocess.Popen[bytes]] = None
+		process: Optional[subprocess.Popen] = None
 		try:
 			process = subprocess.Popen(
 				command,
@@ -1360,8 +1361,8 @@ class Tester:
 		return Verdict(VerdictCode.EXPECTATION, str(result))
 
 	@staticmethod
-	def __display(value: bytes, encoding: str, limit: int = 240) -> str:
-		rendered = repr(value.decode(encoding, errors="backslashreplace"))
+	def __display(value: Union[bytes, str], encoding: str, limit: int = 240) -> str:
+		rendered = repr(value if isinstance(value, str) else value.decode(encoding, errors="backslashreplace"))
 		return rendered if len(rendered) <= limit else rendered[: limit - 3] + "..."
 
 
