@@ -37,7 +37,7 @@ from typing import (
 	Union,
 )
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 PathLike = Union[str, os.PathLike[str]]
 Payload = Union[str, bytes]
@@ -997,6 +997,7 @@ class Tester:
 		try:
 			process = subprocess.Popen(
 				command,
+				universal_newlines=True,
 				cwd=context.workdir,
 				env=environment,
 				stdin=subprocess.PIPE,
