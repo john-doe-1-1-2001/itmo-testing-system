@@ -37,7 +37,7 @@ from typing import (
 	Union,
 )
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 PathLike = Union[str, os.PathLike[str]]
 Payload = Union[str, bytes]
@@ -1223,6 +1223,11 @@ class Tester:
 							VerdictCode.EXPECTATION,
 							f"expect_stdout returned False for step {step_idx}"
 						)
+					elif check is None:
+						result.verdict = Verdict(
+							VerdictCode.EXPECTATION,
+							f"expect_stdout returned None for step {step_idx}"
+						)
 					elif isinstance(check, Verdict):
 						result.verdict = check
 					elif isinstance(check, str):
@@ -1238,6 +1243,11 @@ class Tester:
 						result.verdict = Verdict(
 							VerdictCode.EXPECTATION,
 							f"expect_stderr returned False for step {step_idx}"
+						)
+					elif check is None:
+						result.verdict = Verdict(
+							VerdictCode.EXPECTATION,
+							f"expect_stderr returned None for step {step_idx}"
 						)
 					elif isinstance(check, Verdict):
 						result.verdict = check
