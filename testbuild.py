@@ -37,7 +37,7 @@ from typing import (
 	Union,
 )
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 PathLike = Union[str, os.PathLike[str]]
 Payload = Union[str, bytes]
@@ -184,6 +184,7 @@ class Run:
 	expected: Optional[Expected] = None
 	env: Dict[str, str] = field(default_factory=dict)
 	skip_wrappers: Set[DynamicWrapper] = field(default_factory=set)
+	interactive_steps: List[InteractiveStep] = field(default_factory=list)
 
 
 def _copy_run(source: Run, *, name: Optional[str] = None) -> Run:
@@ -200,6 +201,7 @@ def _copy_run(source: Run, *, name: Optional[str] = None) -> Run:
 		expected=source.expected,
 		env=dict(source.env),
 		skip_wrappers=set(source.skip_wrappers),
+		interactive_steps=list(source.interactive_steps),
 	)
 
 
@@ -245,6 +247,96 @@ class Runned:
 
 	def get_workdir(self) -> Path:
 		return self.workdir
+
+
+@dataclass
+class InteractiveRunned:
+	"""Result of an interactive (line-by-line) run."""
+
+	executable: Path
+	group: str
+	test_name: str
+	run_name: str
+	command: Tuple[str, ...]
+	workdir: Path
+	returncode: Optional[int]
+	stdout: bytes  # full accumulated stdout
+	stderr: bytes  # full accumulated stderr
+	duration: float
+	dynamic_wrapper: DynamicWrapper
+	steps: List[InteractiveStepResult] = field(default_factory=list)
+	wrapper_log: Optional[str] = None
+	timed_out: bool = False
+	launch_error: Optional[str] = None
+	encoding: str = "utf-8"
+
+	@property
+	def stdout_text(self) -> str:
+		if isinstance(self.stdout, str):
+			return self.stdout
+		return self.stdout.decode(self.encoding, errors="replace")
+
+	@property
+	def stderr_text(self) -> str:
+		if isinstance(self.stderr, str):
+			return self.stderr
+		return self.stderr.decode(self.encoding, errors="replace")
+
+	def get_returncode(self) -> Optional[int]:
+		return self.returncode
+
+	def get_stdout(self) -> str:
+		return self.stdout_text
+
+	def get_stderr(self) -> str:
+		return self.stderr_text
+
+	def get_workdir(self) -> Path:
+		return self.workdir
+
+
+@dataclass
+class InteractiveStep:
+	"""One step of interactive interaction: send input, then check response."""
+
+	input_line: str = ""
+	expect_stdout: Optional[Callable[[str], CheckReturn]] = None
+	expect_stderr: Optional[Callable[[str], CheckReturn]] = None
+	timeout: float = 5.0
+
+
+@dataclass
+class InteractiveRun(Run):
+	"""A run that proceeds via interactive line-by-line dialogue."""
+
+	steps: List[InteractiveStep] = field(default_factory=list)
+
+
+@dataclass
+class InteractiveStepResult:
+	"""Result of a single interactive step."""
+
+	step_index: int
+	input_line: str
+	stdout: str = ""
+	stderr: str = ""
+	verdict: Verdict = OK
+
+
+class InteractiveExpected(ABC):
+	"""Task-specific checker for interactive (line-by-line) programs.
+
+	The framework sends each step's input_line to the process, captures
+	the stdout that appears before the next prompt or EOF, and then
+	invokes :meth:`check_step` for per-step assertions.  After the last
+	step the framework checks return code / stderr normally.
+	"""
+
+	@abstractmethod
+	def check_step(
+		self, step: InteractiveStep, result: InteractiveStepResult
+	) -> CheckReturn:
+		raise NotImplementedError
 
 
 class Action(Protocol):
@@ -547,6 +639,10 @@ class RunBuilder:
 
 	def skip_when(self, *wrappers: DynamicWrapper) -> None:
 		self.__spec.skip_wrappers.update(DynamicWrapper(item) for item in wrappers)
+
+	def interactive(self, steps: Iterable[InteractiveStep]) -> None:
+		"""Configure this run to use interactive (line-by-line) mode."""
+		self.__spec.interactive_steps = list(steps)
 
 
 class TestBuilder(RunBuilder):
@@ -909,7 +1005,7 @@ class Tester:
 		environment = dict(os.environ)
 		environment.update(self.env)
 		context = ActionContext(executable, wrapper, group, test, workdir, environment)
-		runned_items: List[Runned] = []
+		runned_items: List[Union[Runned, InteractiveRunned]] = []  # type: ignore[assignment]
 		verdict = OK
 		try:
 			if test.seed_directory is not None:
@@ -920,22 +1016,55 @@ class Tester:
 					if wrapper in run.skip_wrappers:
 						verdict = skip(f"{wrapper.value} is disabled for this run")
 						break
-					runned = self.__execute_run(
-						executable,
-						wrapper,
-						timeout_factor,
-						group,
-						test,
-						run,
-						context,
-					)
-					runned_items.append(runned)
-					context.runned = runned
-					verdict = self.__pretest(run, runned)
-					if verdict and run.expected is not None:
-						verdict = self.__invoke_expected(run.expected, run, runned)
-					if not verdict:
-						break
+					if run.interactive_steps:
+						runned = self.__execute_interactive_run(
+							executable,
+							wrapper,
+							timeout_factor,
+							group,
+							test,
+							run,
+							context,
+						)
+						# Check InteractiveExpected step-by-step
+						if isinstance(run.expected, InteractiveExpected):
+							for sr in runned.steps:  # type: ignore[union-attr]
+								check = run.expected.check_step(
+									sr.step_index, sr
+								)
+								if check is False:
+									verdict = Verdict(
+										VerdictCode.EXPECTATION,
+										f"step {sr.step_index} failed"
+									)
+									break
+								if isinstance(check, Verdict):
+									verdict = check
+									break
+								if isinstance(check, str):
+									verdict = Verdict(
+										VerdictCode.EXPECTATION, check
+									)
+									break
+						if verdict:
+							verdict = self.__pretest(run, runned)
+					else:
+						runned = self.__execute_run(
+							executable,
+							wrapper,
+							timeout_factor,
+							group,
+							test,
+							run,
+							context,
+						)
+						runned_items.append(runned)
+						context.runned = runned
+						verdict = self.__pretest(run, runned)
+						if verdict and run.expected is not None:
+							verdict = self.__invoke_expected(run.expected, run, runned)
+						if not verdict:
+							break
 		except Exception as error:
 			verdict = Verdict(
 				VerdictCode.INTERNAL_ERROR, f"{type(error).__name__}: {error}"
@@ -974,6 +1103,189 @@ class Tester:
 			return Verdict(
 				VerdictCode.HOOK_ERROR,
 				f"{stage} hook: {type(error).__name__}: {error}",
+			)
+
+	def __execute_interactive_run(
+		self,
+		executable: Path,
+		wrapper: DynamicWrapper,
+		timeout_factor: float,
+		group: GroupSpec,
+		test: TestSpec,
+		run: Run,
+		context: ActionContext,
+	) -> InteractiveRunned:
+		"""Execute a run with line-by-line interactive input.
+
+		Uses a reader thread to continuously drain stdout/stderr while
+		the main thread sends input line by line, avoiding hangs from
+		blocked pipe buffers.
+		"""
+		import threading
+
+		wrapper_log_path = context.workdir / f".testbuild-{wrapper.value}.log"
+		command = self.__command(executable, run.args, wrapper, wrapper_log_path)
+		environment = dict(context.env)
+		environment.update(run.env)
+		started = time.monotonic()
+		process: Optional[subprocess.Popen[bytes]] = None
+
+		# Shared buffers protected by a lock
+		_lock = threading.Lock()
+		_stdout = bytearray()
+		_stderr = bytearray()
+		_eof_stdout = threading.Event()
+		_eof_stderr = threading.Event()
+		total_timeout = run.timeout * timeout_factor
+
+		def _drain(stream: TextIO, event: threading.Event, buf: bytearray) -> None:
+			"""Read all data from stream until EOF, appending to buf."""
+			try:
+				for line in iter(stream.readline, ""):
+					with _lock:
+						buf.extend(line.encode(self.encoding, errors="replace"))
+			except Exception:
+				pass
+			finally:
+				event.set()
+
+		try:
+			process = subprocess.Popen(
+				command,
+				cwd=context.workdir,
+				env=environment,
+				universal_newlines=True,
+				stdin=subprocess.PIPE,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+				start_new_session=(os.name == "posix"),
+			)
+			encoding = self.encoding
+
+			# Start reader threads
+			stdout_thread = threading.Thread(
+				target=_drain, args=(process.stdout, _eof_stdout, _stdout),
+				daemon=True,
+			)
+			stderr_thread = threading.Thread(
+				target=_drain, args=(process.stderr, _eof_stderr, _stderr),
+				daemon=True,
+			)
+			stdout_thread.start()
+			stderr_thread.start()
+
+			steps_results: List[InteractiveStepResult] = []
+
+			for step_idx, step in enumerate(run.interactive_steps):
+				step_timeout = step.timeout * timeout_factor
+
+				# Check if process has already exited
+				if process.poll() is not None:
+					break
+
+				# Send input line (text mode with universal_newlines=True)
+				try:
+					process.stdin.write(step.input_line + "\n")
+					process.stdin.flush()
+				except (BrokenPipeError, OSError):
+					break
+
+				# Wait for output to appear (poll the lock)
+				end = time.monotonic() + step_timeout
+				step_output = b""
+				while time.monotonic() < end:
+					with _lock:
+						step_output = bytes(_stdout)
+					if step_output:
+						break
+					time.sleep(0.02)
+
+				stdout_str = step_output.decode(encoding, errors="replace")
+				result = InteractiveStepResult(
+					step_index=step_idx,
+					input_line=step.input_line,
+					stdout=stdout_str,
+				)
+				steps_results.append(result)
+
+			# Close stdin to send EOF
+			if process.stdin:
+				process.stdin.close()
+
+			# Wait for reader threads and process
+			stdout_thread.join(timeout=total_timeout)
+			stderr_thread.join(timeout=total_timeout)
+			try:
+				process.wait(timeout=total_timeout)
+			except subprocess.TimeoutExpired:
+				self.__kill_process(process)
+				process.communicate()
+				wrapper_log: Optional[str] = (
+					wrapper_log_path.read_text(
+						encoding="utf-8", errors="replace"
+					) if wrapper_log_path.is_file() else None
+				)
+				with _lock:
+					return InteractiveRunned(
+						executable,
+						group.name,
+						test.name,
+						run.name,
+						tuple(command),
+						context.workdir,
+						None,
+						bytes(_stdout),
+						bytes(_stderr),
+						time.monotonic() - started,
+						wrapper,
+						steps_results,
+						wrapper_log,
+						timed_out=True,
+						encoding=encoding,
+					)
+
+			returncode = process.returncode
+			wrapper_log: Optional[str] = None
+			if wrapper_log_path.is_file():
+				wrapper_log = wrapper_log_path.read_text(
+					encoding="utf-8", errors="replace"
+				)
+
+			with _lock:
+				return InteractiveRunned(
+					executable,
+					group.name,
+					test.name,
+					run.name,
+					tuple(command),
+					context.workdir,
+					returncode,
+					bytes(_stdout),
+					bytes(_stderr),
+					time.monotonic() - started,
+					wrapper,
+					steps_results,
+					wrapper_log,
+					encoding=encoding,
+				)
+		except Exception as error:
+			if process is not None and process.poll() is None:
+				self.__kill_process(process)
+				process.communicate()
+			return InteractiveRunned(
+				executable,
+				group.name,
+				test.name,
+				run.name,
+				tuple(command),
+				context.workdir,
+				None,
+				b"",
+				b"",
+				time.monotonic() - started,
+				wrapper,
+				encoding=encoding,
+				launch_error=f"{type(error).__name__}: {error}",
 			)
 
 	def __execute_run(
@@ -1378,6 +1690,10 @@ __all__ = [
 	"FileSource",
 	"GroupBuilder",
 	"HookBuilder",
+	"InteractiveExpected",
+	"InteractiveRunned",
+	"InteractiveStep",
+	"InteractiveStepResult",
 	"MultiRunTestBuilder",
 	"PolicyValue",
 	"Report",
