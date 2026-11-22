@@ -37,7 +37,7 @@ from typing import (
 	Union,
 )
 
-__version__ = "0.0.8"
+__version__ = "0.0.9"
 
 PathLike = Union[str, os.PathLike[str]]
 Payload = Union[str, bytes]
@@ -1216,25 +1216,22 @@ class Tester:
 				)
 
 				# Validate expect_stdout callback
+				# Returns: True → pass, False → fail, str → expected value for diff, None → pass (skipped)
 				if step.expect_stdout is not None:
 					check = step.expect_stdout(stdout_str)
 					if check is False:
 						result.verdict = Verdict(
 							VerdictCode.EXPECTATION,
-							f"expect_stdout returned False for step {step_idx}"
+							f"step {step_idx} failed\n  expected:\n<callback returned False>\n  actual:\n{stdout_str}"
 						)
-					elif check is None:
-						result.verdict = Verdict(
-							VerdictCode.EXPECTATION,
-							f"expect_stdout returned None for step {step_idx}"
-						)
-					elif isinstance(check, Verdict):
-						result.verdict = check
 					elif isinstance(check, str):
 						result.verdict = Verdict(
 							VerdictCode.EXPECTATION,
-							f"expect_stdout: {check}"
+							f"step {step_idx} failed\n  expected:\n{check}\n  actual:\n{stdout_str}"
 						)
+					elif isinstance(check, Verdict):
+						result.verdict = check
+					# None → pass (callback skipped this step)
 
 				# Validate expect_stderr callback
 				if step.expect_stderr is not None:
@@ -1242,20 +1239,16 @@ class Tester:
 					if check is False:
 						result.verdict = Verdict(
 							VerdictCode.EXPECTATION,
-							f"expect_stderr returned False for step {step_idx}"
+							f"step {step_idx} failed\n  expected:\n<callback returned False>\n  actual:\n{stderr_str}"
 						)
-					elif check is None:
-						result.verdict = Verdict(
-							VerdictCode.EXPECTATION,
-							f"expect_stderr returned None for step {step_idx}"
-						)
-					elif isinstance(check, Verdict):
-						result.verdict = check
 					elif isinstance(check, str):
 						result.verdict = Verdict(
 							VerdictCode.EXPECTATION,
-							f"expect_stderr: {check}"
+							f"step {step_idx} failed\n  expected:\n{check}\n  actual:\n{stderr_str}"
 						)
+					elif isinstance(check, Verdict):
+						result.verdict = check
+					# None → pass
 
 				steps_results.append(result)
 
