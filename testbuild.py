@@ -37,7 +37,7 @@ from typing import (
 	Union,
 )
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 PathLike = Union[str, os.PathLike[str]]
 Payload = Union[str, bytes]
@@ -1026,6 +1026,11 @@ class Tester:
 							run,
 							context,
 						)
+						# Check per-step expect_stdout/expect_stderr verdicts
+						for sr in runned.steps:  # type: ignore[union-attr]
+							if sr.verdict.is_failed():
+								verdict = sr.verdict
+								break
 						# Check InteractiveExpected step-by-step
 						if isinstance(run.expected, InteractiveExpected):
 							for sr in runned.steps:  # type: ignore[union-attr]
@@ -1046,7 +1051,8 @@ class Tester:
 										VerdictCode.EXPECTATION, check
 									)
 									break
-						if verdict:
+						# Only run pretest if no error found yet
+						if verdict.is_success():
 							verdict = self.__pretest(run, runned)
 					else:
 						runned = self.__execute_run(
@@ -1201,11 +1207,46 @@ class Tester:
 					time.sleep(0.02)
 
 				stdout_str = step_output.decode(encoding, errors="replace")
+				stderr_str = bytes(_stderr).decode(encoding, errors="replace")
 				result = InteractiveStepResult(
 					step_index=step_idx,
 					input_line=step.input_line,
 					stdout=stdout_str,
+					stderr=stderr_str,
 				)
+
+				# Validate expect_stdout callback
+				if step.expect_stdout is not None:
+					check = step.expect_stdout(stdout_str)
+					if check is False:
+						result.verdict = Verdict(
+							VerdictCode.EXPECTATION,
+							f"expect_stdout returned False for step {step_idx}"
+						)
+					elif isinstance(check, Verdict):
+						result.verdict = check
+					elif isinstance(check, str):
+						result.verdict = Verdict(
+							VerdictCode.EXPECTATION,
+							f"expect_stdout: {check}"
+						)
+
+				# Validate expect_stderr callback
+				if step.expect_stderr is not None:
+					check = step.expect_stderr(stderr_str)
+					if check is False:
+						result.verdict = Verdict(
+							VerdictCode.EXPECTATION,
+							f"expect_stderr returned False for step {step_idx}"
+						)
+					elif isinstance(check, Verdict):
+						result.verdict = check
+					elif isinstance(check, str):
+						result.verdict = Verdict(
+							VerdictCode.EXPECTATION,
+							f"expect_stderr: {check}"
+						)
+
 				steps_results.append(result)
 
 			# Close stdin to send EOF
